@@ -6,15 +6,22 @@ _SNIPPET_LIMIT = 300
 
 
 def build_get_memory_response(store: MemoryStore, project: str) -> str:
-    entry = store.latest(project)
+    entry = store.latest_any(project)
     if entry is None:
         return _NO_MEMORY
     return entry.content
 
 
 def build_search_response(store: MemoryStore, project: str, query: str) -> str:
-    """全文搜索本项目记忆，格式化为可读文本。命中条目会被 touch（更新访问时间）。"""
-    entries = store.search(query, project=project)
+    """分级检索：常驻 → 归档 → 会话摘要 → 零散。FTS 全空时尝试语义兜底。"""
+    entries = store.search_tiered(query, project=project)
+
+    # --- 语义兜底（只在 FTS 全空时才走；先懒回填缺失向量，绝不混合打分） ---
+    if not entries:
+        from ai_memory import embeddings as _emb
+        entries = _emb.semantic_search(store, query, project=project, limit=10,
+                                       cfg=_load_cfg_safe())
+
     if not entries:
         return f"未找到与「{query}」相关的记忆。"
     blocks = [f"找到 {len(entries)} 条与「{query}」相关的记忆："]
@@ -25,6 +32,15 @@ def build_search_response(store: MemoryStore, project: str, query: str) -> str:
         session = f" session={e.session_id}" if e.session_id else ""
         blocks.append(f"\n---\n[{i}] {e.created_at} type={e.type}{session} id={e.id}\n{snippet}")
     return "\n".join(blocks)
+
+
+def _load_cfg_safe() -> dict:
+    """加载配置，任何异常返回空 dict（语义兜底绝不能阻塞检索）。"""
+    try:
+        from ai_memory.config import load_config
+        return load_config()
+    except Exception:
+        return {}
 
 
 def create_server(store: MemoryStore, project: str):

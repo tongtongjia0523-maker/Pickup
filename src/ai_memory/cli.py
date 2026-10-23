@@ -1,6 +1,7 @@
 """ai-memory 命令行：管理本地记忆库。
 
 子命令：init / status / run / list / show / search / export / forget / prune / stats
+        core（常驻核心记忆）/ web（本地配置网页）
 """
 import argparse
 import sys
@@ -38,7 +39,8 @@ def _cmd_init(args) -> int:
         "1. SessionStart hook（自动续接）：在 ~/.claude/settings.json 的 hooks.SessionStart\n"
         "   中添加本仓库 hooks/session_start.py 脚本路径，详见 README。\n"
         "2. MCP 工具（按需深查）：claude mcp add ai-memory -- python -m ai_memory.mcp_server\n"
-        "3. CLAUDE.md 中加一行 @.claude/memory/summary.md 可自动注入上次摘要。"
+        "3. 常驻核心记忆：ai-memory core set \"我是后端工程师…\" 或 ai-memory web\n"
+        "4. 本地配置网页：ai-memory web（仅 127.0.0.1 可访问）"
     )
     return 0
 
@@ -50,7 +52,7 @@ def _cmd_status(args) -> int:
     project = args.project or current_project()
     store = _store()
     provider = provider_from_config(cfg)
-    provider_name = cfg["provider"].get("name", "none")
+    provider_name = cfg["provider"].get("name", "auto")
     effective = type(provider).__name__
     note = "" if effective == "NoneProvider" and provider_name == "none" else \
         f"（配置 name={provider_name}，实际生效 {effective}）"
@@ -96,9 +98,9 @@ def _cmd_run(args) -> int:
     if out is None:
         print("没有可提炼的历史会话（会话目录为空、内容为空或尚未有会话文件）。")
         return 0
-    print(f"本项目现有记忆 {len(store.all(project))} 条")
+    print(f"本项目现有记忆 {len(store.list_entries(project=project, limit=100000))} 条")
     print(f"摘要已导出：{out}")
-    latest = store.latest(project)
+    latest = store.latest_any(project)
     if latest is not None:
         print(f"（摘要只注入最新一条，其余请用 `ai-memory search` 检索）")
     return 0
@@ -120,7 +122,7 @@ def _cmd_list(args) -> int:
 def _cmd_show(args) -> int:
     store = _store()
     if args.id == "latest":
-        entry = store.latest(args.project or current_project())
+        entry = store.latest_any(args.project or current_project())
     else:
         entry = store.get(args.id)
         if entry is None:  # 支持 id 前缀
@@ -138,8 +140,15 @@ def _cmd_show(args) -> int:
 
 def _cmd_search(args) -> int:
     store = _store()
-    entries = store.search(args.query, project=args.project or current_project(),
-                           limit=args.limit)
+    project = args.project or current_project()
+    entries = store.search_tiered(args.query, project=project, limit=args.limit)
+
+    # --- 语义兜底：FTS 分级全空才走，先懒回填缺失向量，绝不混合打分 ---
+    if not entries:
+        from ai_memory import embeddings as _emb
+        entries = _emb.semantic_search(store, args.query, project=project,
+                                       limit=args.limit)
+
     if not entries:
         print(f"未找到与「{args.query}」相关的记忆。")
         return 0
@@ -217,6 +226,45 @@ def _cmd_stats(args) -> int:
     return 0
 
 
+def _cmd_core(args) -> int:
+    """常驻核心记忆：角色、性格、写作风格、高频问题（每项目一条）。"""
+    store = _store()
+    project = args.project or current_project()
+    if args.action == "show":
+        core = store.get_core(project)
+        if core is None:
+            print(f"（项目 {project} 尚未设置核心记忆）\n"
+                  f"用 `ai-memory core set \"...\"` 或 `ai-memory web` 添加。")
+            return 0
+        print(core.content)
+        return 0
+
+    if args.file:
+        content = Path(args.file).read_text(encoding="utf-8")
+    else:
+        content = args.text or ""
+    content = content.strip()
+    if not content:
+        print("内容为空，未写入。用法：ai-memory core set \"我是后端工程师…\"", file=sys.stderr)
+        return 1
+    entry = store.set_core(project, content)
+    # 核心记忆也参与语义兜底：写入后尽力生成向量（失败静默跳过）
+    from ai_memory import embeddings as _emb
+    _emb.try_embed(store, entry.id, content)
+    print(f"已保存核心记忆：{len(content)} 字，id {entry.id[:8]}，项目 {project}")
+    if len(content) > 300:
+        print("提示：超过 300 字，注入到会话时只显示前 300 字。")
+    return 0
+
+
+def _cmd_web(args) -> int:
+    """启动本地配置网页（仅 127.0.0.1 可访问）。"""
+    from ai_memory.web import run
+
+    run(port=args.port, project=args.project, open_browser=not args.no_open)
+    return 0
+
+
 # ---------- 入口 ----------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -264,6 +312,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--yes", action="store_true", help="真正执行软删除")
 
     sub.add_parser("stats", help="记忆库统计")
+
+    p = sub.add_parser("core", help="常驻核心记忆（角色/性格/写作风格/高频问题）")
+    p.add_argument("action", choices=["show", "set"])
+    p.add_argument("text", nargs="?", help="要写入的内容（set 时使用）")
+    p.add_argument("--file", help="从文件读取内容（set 时优先于 text）")
+    p.add_argument("--project")
+
+    p = sub.add_parser("web", help="启动本地配置网页（仅本机可访问）")
+    p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--project")
+    p.add_argument("--no-open", action="store_true", help="不自动打开浏览器")
     return parser
 
 
@@ -278,6 +337,8 @@ _COMMANDS = {
     "forget": _cmd_forget,
     "prune": _cmd_prune,
     "stats": _cmd_stats,
+    "core": _cmd_core,
+    "web": _cmd_web,
 }
 
 
