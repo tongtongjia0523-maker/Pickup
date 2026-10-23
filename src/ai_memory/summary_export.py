@@ -18,7 +18,7 @@ def export_summary(store: MemoryStore, project: str, directory: Path,
     extra_sessions：catch-up 时同批入库的其他会话 [(session_id, summary), ...]，
     以索引段形式附在摘要末尾，提示用 search_memory 检索（摘要注入永远只有最新一条）。
     """
-    entry = store.latest(project)
+    entry = store.latest_any(project)
     if entry is None:
         return None
     body = entry.content

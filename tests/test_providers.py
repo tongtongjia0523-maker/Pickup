@@ -24,8 +24,14 @@ def test_fake_provider_returns_fixed_text():
 
 # ---------- 工厂 ----------
 
-def test_default_is_none_provider(tmp_path):
+def test_default_is_auto_and_falls_back_to_none(tmp_path, monkeypatch):
+    """默认 auto：本机没有任何可用模型时，静默回退到规则提炼。"""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr("ai_memory.providers.detect_local_endpoint",
+                        lambda timeout=0.6: None)
     cfg = load_config(tmp_path / "none.toml")
+    assert cfg["provider"]["name"] == "auto"
     assert isinstance(provider_from_config(cfg), NoneProvider)
 
 
@@ -52,8 +58,54 @@ def test_openai_auto_detect_used(monkeypatch):
     assert p.base_url == "http://localhost:1234/v1" and p.model == "qwen"
 
 
-def test_unknown_name_falls_back_to_none():
+def test_unknown_name_falls_back_to_none(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr("ai_memory.providers.detect_local_endpoint",
+                        lambda timeout=0.6: None)
     assert isinstance(provider_from_config(_cfg({"name": "ollama"})), NoneProvider)
+
+
+# ---------- auto：自动接入可用模型 ----------
+
+def test_auto_uses_explicit_base_url():
+    p = provider_from_config(_cfg({"name": "auto", "base_url": "http://x:1/v1", "model": "m"}))
+    assert isinstance(p, OpenAICompatProvider)
+    assert p.base_url == "http://x:1/v1" and p.model == "m"
+
+
+def test_auto_prefers_anthropic_key(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
+    assert isinstance(provider_from_config(_cfg({"name": "auto"})), AnthropicProvider)
+
+
+def test_auto_uses_openai_key_and_base_url(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.deepseek.com/v1")
+    p = provider_from_config(_cfg({"name": "auto"}))
+    assert isinstance(p, OpenAICompatProvider)
+    assert p.base_url == "https://api.deepseek.com/v1"
+    assert p.api_key == "sk-openai"
+
+
+def test_auto_detects_local_endpoint(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr("ai_memory.providers.detect_local_endpoint",
+                        lambda timeout=0.6: ("http://localhost:11434/v1", "llama3"))
+    p = provider_from_config(_cfg({"name": "auto"}))
+    assert isinstance(p, OpenAICompatProvider)
+    assert p.base_url == "http://localhost:11434/v1" and p.model == "llama3"
+
+
+def test_auto_falls_back_to_none(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr("ai_memory.providers.detect_local_endpoint",
+                        lambda timeout=0.6: None)
+    assert isinstance(provider_from_config(_cfg({"name": "auto"})), NoneProvider)
 
 
 # ---------- 本地探测 ----------

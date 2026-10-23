@@ -2,8 +2,24 @@ import json
 import os
 from pathlib import Path
 from ai_memory.providers import FakeProvider
-from ai_memory.trigger import run_trigger
+from ai_memory.trigger import classify_session, run_trigger
 from ai_memory.store import MemoryStore
+
+
+# ---------- v3：会话分类 ----------
+
+def test_classify_scratch_for_short_session():
+    assert classify_session("[user] 帮我写个脚本\n[assistant] 好的，用 requests") == "scratch"
+
+
+def test_classify_archive_when_artifact_present():
+    text = "[user] 实现登录\n[user] 再改一下\n[assistant] 已写入 auth.py\n```python\npass\n```"
+    assert classify_session(text) == "archive"
+
+
+def test_classify_session_summary_for_regular_session():
+    text = "".join(f"[user] 第{i}个问题\n" for i in range(5))
+    assert classify_session(text) == "session_summary"
 
 
 def _write_session(root: Path, name: str, text: str, mtime=None):
@@ -25,7 +41,7 @@ def test_run_trigger_writes_summary(tmp_path, monkeypatch):
     result = run_trigger(store, "proj", tmp_path, FakeProvider("提炼摘要"))
 
     assert result is not None
-    assert store.latest("proj").content == "提炼摘要"
+    assert store.latest_any("proj").content == "提炼摘要"
     assert (tmp_path / "summary.md").read_text(encoding="utf-8").find("提炼摘要") != -1
 
 

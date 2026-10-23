@@ -1,7 +1,7 @@
 """LLM Provider 抽象。
 
 三种实现：
-- NoneProvider（默认）：纯本地规则提炼，零依赖零成本可离线。诚实降级——
+- NoneProvider（兜底）：纯本地规则提炼，零依赖零成本可离线。诚实降级——
   不做语义归纳，「结论」明确标注未归纳，不编造。
 - OpenAICompatProvider：任意 OpenAI 兼容端点。本机已运行的 Ollama(11434)/
   LM Studio(1234)/llama.cpp(8080)/vLLM(8000) 自动探测即用；也覆盖
@@ -210,17 +210,29 @@ class AnthropicProvider:
 # ---------- 工厂 ----------
 
 def provider_from_config(cfg: dict) -> LLMProvider:
-    """按配置构造 provider。openai 无端点且探测失败时静默回退 NoneProvider。"""
+    """按配置构造 provider。
+
+    name=auto（默认）时的探测优先级：
+      1) 显式 base_url（配置里写了就直接用，不探测）
+      2) 环境变量密钥：ANTHROPIC_API_KEY → Anthropic；OPENAI_API_KEY → OpenAI 兼容
+      3) 本机已在运行的服务：Ollama(11434)/LM Studio(1234)/llama.cpp(8080)/vLLM(8000)
+      4) 以上都没有 → NoneProvider 规则提炼
+    任何一步失败都静默降级，绝不抛错、不阻塞宿主启动。
+    """
     p = cfg.get("provider", {})
-    name = str(p.get("name") or "none").lower()
+    name = str(p.get("name") or "auto").lower()
     timeout = int(p.get("timeout_seconds", 30))
+    base = str(p.get("base_url") or "")
+    model = str(p.get("model") or "")
+    api_key = str(p.get("api_key") or "")
+
+    if name == "none":
+        return NoneProvider()
 
     if name == "anthropic":
         return AnthropicProvider(timeout=timeout)
 
     if name in ("openai", "openai_compat", "local"):
-        base = str(p.get("base_url") or "")
-        model = str(p.get("model") or "")
         if not base and p.get("auto_detect", True):
             found = detect_local_endpoint()
             if found:
@@ -229,7 +241,24 @@ def provider_from_config(cfg: dict) -> LLMProvider:
         if not base:
             return NoneProvider()  # 配置了但没服务可用 → 静默降级
         return OpenAICompatProvider(base, model or "default",
-                                    api_key=str(p.get("api_key") or ""),
-                                    timeout=timeout)
+                                    api_key=api_key, timeout=timeout)
 
+    # ---------- auto：自动接入任何可用模型 ----------
+    if base:
+        return OpenAICompatProvider(base, model or "default",
+                                    api_key=api_key, timeout=timeout)
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return AnthropicProvider(timeout=timeout)
+    if os.environ.get("OPENAI_API_KEY"):
+        return OpenAICompatProvider(
+            os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1",
+            model or "gpt-4o-mini",
+            api_key=os.environ["OPENAI_API_KEY"], timeout=timeout,
+        )
+    if p.get("auto_detect", True):
+        found = detect_local_endpoint()
+        if found:
+            detected_base, detected_model = found
+            return OpenAICompatProvider(detected_base, model or detected_model or "default",
+                                        timeout=timeout)
     return NoneProvider()
