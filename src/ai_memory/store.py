@@ -14,10 +14,16 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # 永不自动回收的类型
 PROTECTED_TYPES = ("core_memory", "archive")
+
+# 会话类记忆的分类（core_memory 为常驻，单独注入）
+SESSION_TYPES = ("session_summary", "archive", "scratch")
+
+# 分级检索顺序：常驻 → 归档 → 会话摘要 → 零散追问
+TIER_ORDER = ("core_memory", "archive", "session_summary", "scratch")
 
 _BASE_TABLE = """
 CREATE TABLE IF NOT EXISTS memory_entry (
@@ -83,6 +89,10 @@ class MemoryStore:
             if version < 2:
                 self._migrate_v2(conn)
                 conn.execute("PRAGMA user_version = 2")
+                version = 2
+            if version < 3:
+                self._migrate_v3(conn)
+                conn.execute("PRAGMA user_version = 3")
 
     def _migrate_v2(self, conn: sqlite3.Connection) -> None:
         for ddl in (
@@ -134,6 +144,20 @@ class MemoryStore:
             "SELECT rowid, content, id FROM memory_entry"
         )
 
+    def _migrate_v3(self, conn: sqlite3.Connection) -> None:
+        # 独立表存向量，不污染主表；embedding 失败的 entry 主表照常存在
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_embedding (
+                entry_id    TEXT PRIMARY KEY,
+                embedding   BLOB NOT NULL,
+                model       TEXT NOT NULL,
+                dim         INTEGER NOT NULL,
+                created_at  TEXT NOT NULL
+            )
+            """
+        )
+
     # ---------- write ----------
 
     def append(self, entry: MemoryEntry) -> bool:
@@ -167,6 +191,83 @@ class MemoryStore:
                 [(_now(), i) for i in entry_ids],
             )
 
+    # ---------- embedding ----------
+
+    def store_embedding(self, entry_id: str, vec: list[float], model: str) -> None:
+        """为一条记忆存向量（幂等，已存在则覆盖）。"""
+        from ai_memory.embeddings import vec_to_blob
+
+        if not vec:
+            return
+        blob = vec_to_blob(vec)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO memory_embedding (entry_id, embedding, model, dim, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(entry_id) DO UPDATE SET
+                    embedding = excluded.embedding,
+                    model = excluded.model,
+                    dim = excluded.dim,
+                    created_at = excluded.created_at
+                """,
+                (entry_id, blob, model, len(vec), _now()),
+            )
+
+    def list_missing_embeddings(self, project: str | None = None,
+                                limit: int = 20) -> list[MemoryEntry]:
+        """取尚无向量的记忆（懒回填用）。按创建时间倒序，避免先补最老的历史数据。"""
+        sql = (
+            f"SELECT {', '.join('e.' + c for c in _COLUMNS)} FROM memory_entry e "
+            "WHERE e.deleted_at IS NULL AND NOT EXISTS ("
+            "SELECT 1 FROM memory_embedding emb WHERE emb.entry_id = e.id)"
+        )
+        params: list = []
+        if project is not None:
+            sql += " AND e.project = ?"
+            params.append(project)
+        sql += " ORDER BY e.created_at DESC LIMIT ?"
+        params.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._row_to_entry(r) for r in rows]
+
+    def get_embedding(self, entry_id: str) -> Optional[list[float]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT embedding FROM memory_embedding WHERE entry_id = ?",
+                (entry_id,),
+            ).fetchone()
+        if not row:
+            return None
+        from ai_memory.embeddings import blob_to_vec
+        return blob_to_vec(row[0])
+
+    def get_all_embeddings(self, project: str | None = None,
+                           include_deleted: bool = False) -> list[tuple[str, list[float]]]:
+        """取出本项目所有带向量的 (entry_id, vec)。"""
+        from ai_memory.embeddings import blob_to_vec
+
+        sql = (
+            "SELECT e.id, emb.embedding FROM memory_entry e "
+            "JOIN memory_embedding emb ON emb.entry_id = e.id "
+            "WHERE 1=1"
+        )
+        params: list = []
+        if not include_deleted:
+            sql += " AND e.deleted_at IS NULL"
+        if project is not None:
+            sql += " AND e.project = ?"
+            params.append(project)
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [(eid, blob_to_vec(blob)) for eid, blob in rows]
+
+    def clear_embeddings(self) -> None:
+        """清空所有向量（调试/重建用）。"""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM memory_embedding")
+
     # ---------- read ----------
 
     def _row_to_entry(self, row) -> MemoryEntry:
@@ -181,16 +282,23 @@ class MemoryStore:
         return self._row_to_entry(row) if row else None
 
     def get_by_session(self, project: str, session_id: str,
-                       type: str = "session_summary") -> Optional[MemoryEntry]:
+                       type: str | None = "session_summary") -> Optional[MemoryEntry]:
+        """按 session 查已有记忆；type=None 表示不限类型（跨类型去重用）。"""
+        sql = (f"SELECT {', '.join(_COLUMNS)} FROM memory_entry "
+               "WHERE project = ? AND session_id = ?")
+        params: list = [project, session_id]
+        if type is not None:
+            sql += " AND type = ?"
+            params.append(type)
+        sql += " ORDER BY created_at DESC LIMIT 1"
         with self._connect() as conn:
-            row = conn.execute(
-                f"SELECT {', '.join(_COLUMNS)} FROM memory_entry "
-                "WHERE project = ? AND session_id = ? AND type = ?",
-                (project, session_id, type),
-            ).fetchone()
+            row = conn.execute(sql, params).fetchone()
         return self._row_to_entry(row) if row else None
 
-    def latest(self, project: str, type: str = "session_summary") -> MemoryEntry | None:
+    def latest(self, project: str, type: str | None = "session_summary") -> MemoryEntry | None:
+        """最近一条记忆；type=None 表示按注入优先级取（常驻 → 归档 → 会话 → 零散）。"""
+        if type is None:
+            return self.latest_any(project)
         with self._connect() as conn:
             row = conn.execute(
                 f"SELECT {', '.join(_COLUMNS)} FROM memory_entry "
@@ -200,13 +308,55 @@ class MemoryStore:
             ).fetchone()
         return self._row_to_entry(row) if row else None
 
-    def all(self, project: str, type: str = "session_summary") -> list[MemoryEntry]:
+    def latest_any(self, project: str) -> MemoryEntry | None:
+        """本项目最近一条会话类记忆（不论 session_summary/archive/scratch）。"""
+        placeholders = ", ".join("?" for _ in SESSION_TYPES)
+        with self._connect() as conn:
+            row = conn.execute(
+                f"SELECT {', '.join(_COLUMNS)} FROM memory_entry "
+                f"WHERE project = ? AND type IN ({placeholders}) AND deleted_at IS NULL "
+                "ORDER BY created_at DESC LIMIT 1",
+                (project, *SESSION_TYPES),
+            ).fetchone()
+        return self._row_to_entry(row) if row else None
+
+    # ---------- 常驻核心记忆 ----------
+
+    def get_core(self, project: str) -> MemoryEntry | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                f"SELECT {', '.join(_COLUMNS)} FROM memory_entry "
+                "WHERE project = ? AND type = 'core_memory' AND deleted_at IS NULL "
+                "ORDER BY created_at DESC LIMIT 1",
+                (project,),
+            ).fetchone()
+        return self._row_to_entry(row) if row else None
+
+    def set_core(self, project: str, content: str) -> MemoryEntry:
+        """写入/更新常驻核心记忆。每个项目只保留一条（存在则原地更新）。"""
+        existing = self.get_core(project)
+        if existing is not None:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE memory_entry SET content = ?, last_accessed_at = ? WHERE id = ?",
+                    (content, _now(), existing.id),
+                )
+            existing.content = content
+            return existing
+        entry = new_entry("core_memory", project, content, _now(), importance=10)
+        self.append(entry)
+        return entry
+
+    def all(self, project: str, type: str | None = None) -> list[MemoryEntry]:
+        """本项目全部会话类记忆；type=None 时包含 session_summary/archive/scratch。"""
+        types = (type,) if type else SESSION_TYPES
+        placeholders = ", ".join("?" for _ in types)
         with self._connect() as conn:
             rows = conn.execute(
                 f"SELECT {', '.join(_COLUMNS)} FROM memory_entry "
-                "WHERE project = ? AND type = ? AND deleted_at IS NULL "
+                f"WHERE project = ? AND type IN ({placeholders}) AND deleted_at IS NULL "
                 "ORDER BY created_at ASC",
-                (project, type),
+                (project, *types),
             ).fetchall()
         return [self._row_to_entry(r) for r in rows]
 
@@ -236,11 +386,12 @@ class MemoryStore:
         return f'"{escaped}"'
 
     def search(self, query: str, project: str | None = None,
-               limit: int = 10) -> list[MemoryEntry]:
+               limit: int = 10, types: tuple[str, ...] | None = None) -> list[MemoryEntry]:
         """FTS5(trigram) 全文搜索；query 不足 3 字符时回退 LIKE。命中条目更新 last_accessed_at。"""
         query = query.strip()
         if not query:
             return []
+        prefix = "e." if len(query) >= 3 else ""
         if len(query) >= 3:
             sql = (
                 f"SELECT {', '.join('e.' + c for c in _COLUMNS)} "
@@ -255,13 +406,81 @@ class MemoryStore:
             )
             params = [f"%{query}%"]
         if project is not None:
-            sql += " AND " + ("e." if len(query) >= 3 else "") + "project = ?"
+            sql += " AND " + prefix + "project = ?"
             params.append(project)
-        sql += " ORDER BY " + ("e." if len(query) >= 3 else "") + "created_at DESC LIMIT ?"
+        if types:
+            sql += " AND " + prefix + f"type IN ({', '.join('?' for _ in types)})"
+            params.extend(types)
+        sql += " ORDER BY " + prefix + "created_at DESC LIMIT ?"
         params.append(limit)
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
         entries = [self._row_to_entry(r) for r in rows]
+        self.touch([e.id for e in entries])
+        return entries
+
+    def search_tiered(self, query: str, project: str | None = None,
+                      limit: int = 10) -> list[MemoryEntry]:
+        """分级检索：常驻 → 归档 → 会话摘要 → 零散追问，前一级有命中即停止。
+
+        目的：优先返回最有价值的记忆，避免一次把整库结果都塞进上下文（省 token）。
+        """
+        for tier in TIER_ORDER:
+            hits = self.search(query, project=project, limit=limit, types=(tier,))
+            if hits:
+                return hits
+        return []
+
+    # ---------- 语义兜底 ----------
+
+    @staticmethod
+    def _cosine(a: list[float], b: list[float]) -> float:
+        import math
+        dot = sum(x * y for x, y in zip(a, b))
+        na = math.sqrt(sum(x * x for x in a))
+        nb = math.sqrt(sum(x * x for x in b))
+        if na == 0 or nb == 0:
+            return 0.0
+        return dot / (na * nb)
+
+    def search_semantic(self, query_vec: list[float], project: str | None = None,
+                        limit: int = 10, threshold: float = 0.3) -> list[MemoryEntry]:
+        """向量检索：按余弦相似度排序 + 阈值过滤。
+
+        设计约束：纯兜底路径，**绝不与 FTS 混合打分**；调用方负责在 FTS 全空
+        时才调用，且负责把 query 先 embed 成 query_vec。store 层不依赖 cfg。
+        """
+        if not query_vec:
+            return []
+
+        # 取本项目所有带 embedding 的记忆
+        vecs = self.get_all_embeddings(project=project)
+        if not vecs:
+            return []
+
+        scored: list[tuple[float, str]] = []
+        for eid, stored_vec in vecs:
+            # 维度不一致（不同 model 产生的）直接跳过
+            if len(stored_vec) != len(query_vec):
+                continue
+            sim = self._cosine(query_vec, stored_vec)
+            if sim >= threshold:
+                scored.append((sim, eid))
+
+        # 相似度降序，limit 截断
+        scored.sort(key=lambda x: x[0], reverse=True)
+        if limit > 0:
+            scored = scored[:limit]
+
+        if not scored:
+            return []
+
+        entries = []
+        eids = [eid for _, eid in scored]
+        for eid in eids:
+            e = self.get(eid)
+            if e is not None and e.deleted_at is None:
+                entries.append(e)
         self.touch([e.id for e in entries])
         return entries
 

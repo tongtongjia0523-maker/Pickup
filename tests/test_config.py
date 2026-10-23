@@ -1,9 +1,11 @@
-from ai_memory.config import DEFAULT_CONFIG, load_config, write_default_config
+from ai_memory.config import (DEFAULT_CONFIG, load_config, save_config_values,
+                              write_default_config)
 
 
 def test_defaults_without_file(tmp_path):
     cfg = load_config(tmp_path / "nonexistent.toml")
-    assert cfg["provider"]["name"] == "none"
+    assert cfg["provider"]["name"] == "auto"   # 默认自动接入可用模型
+    assert cfg["provider"]["auto_detect"] is True
     assert cfg["retention"]["enabled"] is False
     assert cfg["trigger"]["catch_up"] is False
 
@@ -45,3 +47,41 @@ def test_write_default_config_not_overwrite(tmp_path):
     p.write_text('[provider]\nname = "anthropic"\n', encoding="utf-8")
     write_default_config(p)
     assert "anthropic" in p.read_text(encoding="utf-8")
+
+
+# ---------- v3：配置写回（web 配置页用） ----------
+
+def test_save_config_values_updates_and_keeps_comments(tmp_path):
+    p = tmp_path / "config.toml"
+    write_default_config(p)
+    save_config_values({"provider": {"name": "openai", "timeout_seconds": 45}}, p)
+    text = p.read_text(encoding="utf-8")
+    assert "# auto" in text              # 注释模板仍在
+    cfg = load_config(p)
+    assert cfg["provider"]["name"] == "openai"
+    assert cfg["provider"]["timeout_seconds"] == 45
+    assert cfg["trigger"]["catch_up"] is False   # 未改动段保持默认
+
+
+def test_save_config_values_appends_missing_key(tmp_path):
+    p = tmp_path / "c.toml"
+    p.write_text('[provider]\nname = "none"\n', encoding="utf-8")
+    save_config_values({"provider": {"model": "qwen"}}, p)
+    assert load_config(p)["provider"]["model"] == "qwen"
+
+
+def test_save_config_values_creates_missing_section(tmp_path):
+    p = tmp_path / "c.toml"
+    p.write_text('[provider]\nname = "none"\n', encoding="utf-8")
+    save_config_values({"retention": {"enabled": True, "cold_days": 30}}, p)
+    cfg = load_config(p)
+    assert cfg["retention"]["enabled"] is True
+    assert cfg["retention"]["cold_days"] == 30
+    assert cfg["provider"]["name"] == "none"
+
+
+def test_save_config_values_quotes_are_escaped(tmp_path):
+    p = tmp_path / "c.toml"
+    write_default_config(p)
+    save_config_values({"provider": {"api_key": 'a"b\\c'}}, p)
+    assert load_config(p)["provider"]["api_key"] == 'a"b\\c'

@@ -1,6 +1,63 @@
 from ai_memory.store import MemoryStore, MemoryEntry
 
 
+# ---------- v3：常驻核心记忆 / 分类 / 分级检索 ----------
+
+def test_set_core_creates_then_updates_in_place(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    first = store.set_core("proj", "我是后端工程师")
+    second = store.set_core("proj", "我是后端工程师，偏好简洁回答")
+    assert first.id == second.id
+    assert store.get_core("proj").content.endswith("偏好简洁回答")
+    cores = [e for e in store.list_entries(project="proj") if e.type == "core_memory"]
+    assert len(cores) == 1
+
+
+def test_get_core_scoped_by_project(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    store.set_core("A", "A 的核心")
+    assert store.get_core("B") is None
+
+
+def test_latest_any_covers_scratch_and_archive(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    store.append(_make(id="1", type="scratch", session_id="s1", content="零散追问"))
+    assert store.latest("proj") is None           # 默认只查 session_summary
+    assert store.latest_any("proj").id == "1"     # 跨类型能取到
+
+
+def test_get_by_session_any_type(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    store.append(_make(id="1", type="archive", session_id="s1"))
+    assert store.get_by_session("proj", "s1") is None
+    assert store.get_by_session("proj", "s1", type=None).id == "1"
+
+
+def test_search_tiered_stops_at_first_tier(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    store.append(_make(id="1", type="scratch", session_id="s1", content="部署脚本说明"))
+    store.append(_make(id="2", type="archive", session_id="s2", content="部署脚本归档"))
+    store.append(MemoryEntry("3", "core_memory", "proj", None, "部署脚本核心",
+                             "2026-09-03T12:00:00"))
+    hits = store.search_tiered("部署脚本", project="proj")
+    assert [h.type for h in hits] == ["core_memory"]   # 常驻命中即停止，不再下探
+
+
+def test_search_tiered_falls_through_to_scratch(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    store.append(_make(id="1", type="scratch", session_id="s1", content="只有零散里有部署脚本"))
+    hits = store.search_tiered("部署脚本", project="proj")
+    assert [h.type for h in hits] == ["scratch"]
+
+
+def test_search_types_filter(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    store.append(_make(id="1", type="session_summary", session_id="s1", content="缓存设计"))
+    store.append(_make(id="2", type="archive", session_id="s2", content="缓存设计归档"))
+    hits = store.search("缓存设计", project="proj", types=("archive",))
+    assert [h.id for h in hits] == ["2"]
+
+
 def _make(id="1", type="session_summary", project="proj", session_id="s1",
           content="摘要", created_at="2026-09-03T10:00:00"):
     return MemoryEntry(id, type, project, session_id, content, created_at)
@@ -154,7 +211,7 @@ def test_migration_from_v1_schema(tmp_path):
     assert e.content == "旧摘要" and e.importance == 0
     assert store.search("旧摘要")[0].id == "1"  # FTS 已回填
     with sqlite3.connect(db) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert conn.execute("PRAGMA user_version").fetchone()[0] >= 2  # v1→v2→v3 一路迁移
 
 def test_migrate_v1_with_duplicate_sessions_keeps_newest(tmp_path):
     """v1 老库同一 (project, session) 有多条摘要时，迁移先去重再建唯一索引，不应炸。"""
